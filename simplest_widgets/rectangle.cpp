@@ -1,6 +1,9 @@
 #include <QtWidgets>
 #include "rectangle.h"
+
+#if defined(WITH_LTTNG)
 #include "hello-tp.h"
+#endif
 
 Rectangle::Rectangle(QWidget *parent)
     : QWidget(parent)
@@ -29,8 +32,10 @@ void Rectangle::calcAveragePaintTime()
 void Rectangle::paintEvent(QPaintEvent *)
 {
     m_elapsed.start();
+#if defined(WITH_LTTNG)
     tracepoint(hello_world, my_first_tracepoint,
                m_timer->remainingTime(), const_cast<char*>(qPrintable(m_colors[m_colorIdx].name())));
+#endif
 
     // Do the work to paint the rectangle
     QPainter painter(this);
