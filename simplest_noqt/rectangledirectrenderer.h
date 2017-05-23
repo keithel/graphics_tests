@@ -4,14 +4,21 @@
 #include <QObject>
 #include <QImage>
 #include <QPainter>
+#include <QColor>
 
-class RectangleDirectRenderer
+class RectangleDirectRenderer : public QObject
 {
     Q_OBJECT
 public:
     RectangleDirectRenderer() = delete;
-    bool injectInstance(RectangleDirectRenderer* injectedInstance);
-    RectangleDirectRenderer* instance(QObject* parent = nullptr);
+    ~RectangleDirectRenderer();
+    static bool injectInstance(RectangleDirectRenderer* injectedInstance);
+    static RectangleDirectRenderer* instance(QObject* parent = nullptr);
+
+    void fillAlternatingRectsQPainter(
+            const QColor& color1, const QColor& color2,
+            const QRectF& rect, unsigned int nTimes,
+            unsigned long delay);
 
 // Private Methods
 private:
@@ -34,7 +41,8 @@ private:
         int offset, size;
     } mMmap;
 
-    QPainter *mBlitter;
+    QImage mFbScreenImage;
+    QPainter *mBlitter = nullptr;
 };
 
 #endif // RECTANGLEDIRECTRENDERER_H

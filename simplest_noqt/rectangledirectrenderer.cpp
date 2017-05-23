@@ -13,6 +13,10 @@
 #include <linux/kd.h>
 #include <sys/mman.h>
 
+#include <QThread>
+#include <QCoreApplication>
+#include <QTimer>
+
 RectangleDirectRenderer* RectangleDirectRenderer::sInstance = nullptr;
 
 // Some of this code lifted from QLinuxFbScreen
@@ -64,13 +68,13 @@ static int openTtyDevice(const QString &device)
     return fd;
 }
 
-static void switchToGraphicsMode(int ttyfd, bool doSwitch, int *oldMode)
+static void switchToGraphicsMode(int ttyfd, int *oldMode)
 {
     // Do not warn if the switch fails: the ioctl fails when launching from a
     // remote console and there is nothing we can do about it.  The matching
     // call in resetTty should at least fail then, too, so we do no harm.
     if (ioctl(ttyfd, KDGETMODE, oldMode) == 0) {
-        if (doSwitch && *oldMode != KD_GRAPHICS)
+        if (*oldMode != KD_GRAPHICS)
             ioctl(ttyfd, KDSETMODE, KD_GRAPHICS);
     }
 }
@@ -175,103 +179,6 @@ static QImage::Format determineFormat(const fb_var_screeninfo &info, int depth)
     return format;
 }
 
-bool QLinuxFbScreen::initialize()
-{
-    QRegularExpression ttyRx(QLatin1String("tty=(.*)"));
-    QRegularExpression fbRx(QLatin1String("fb=(.*)"));
-    QRegularExpression mmSizeRx(QLatin1String("mmsize=(\\d+)x(\\d+)"));
-    QRegularExpression sizeRx(QLatin1String("size=(\\d+)x(\\d+)"));
-    QRegularExpression offsetRx(QLatin1String("offset=(\\d+)x(\\d+)"));
-
-    QString fbDevice, ttyDevice;
-    QSize userMmSize;
-    QRect userGeometry;
-    bool doSwitchToGraphicsMode = true;
-
-    // Parse arguments
-    for (const QString &arg : qAsConst(mArgs)) {
-        QRegularExpressionMatch match;
-        if (arg == QLatin1String("nographicsmodeswitch"))
-            doSwitchToGraphicsMode = false;
-        else if (arg.contains(mmSizeRx, &match))
-            userMmSize = QSize(match.captured(1).toInt(), match.captured(2).toInt());
-        else if (arg.contains(sizeRx, &match))
-            userGeometry.setSize(QSize(match.captured(1).toInt(), match.captured(2).toInt()));
-        else if (arg.contains(offsetRx, &match))
-            userGeometry.setTopLeft(QPoint(match.captured(1).toInt(), match.captured(2).toInt()));
-        else if (arg.contains(ttyRx, &match))
-            ttyDevice = match.captured(1);
-        else if (arg.contains(fbRx, &match))
-            fbDevice = match.captured(1);
-    }
-
-    if (fbDevice.isEmpty()) {
-        fbDevice = QLatin1String("/dev/fb0");
-        if (!QFile::exists(fbDevice))
-            fbDevice = QLatin1String("/dev/graphics/fb0");
-        if (!QFile::exists(fbDevice)) {
-            qWarning("Unable to figure out framebuffer device. Specify it manually.");
-            return false;
-        }
-    }
-
-
-    // Open the device
-    mFbFd = openFramebufferDevice(fbDevice);
-    if (mFbFd == -1) {
-        qErrnoWarning(errno, "Failed to open framebuffer %s", qPrintable(fbDevice));
-        return false;
-    }
-
-    // Read the fixed and variable screen information
-    fb_fix_screeninfo finfo;
-    fb_var_screeninfo vinfo;
-    memset(&vinfo, 0, sizeof(vinfo));
-    memset(&finfo, 0, sizeof(finfo));
-
-    if (ioctl(mFbFd, FBIOGET_FSCREENINFO, &finfo) != 0) {
-        qErrnoWarning(errno, "Error reading fixed information");
-        return false;
-    }
-
-    if (ioctl(mFbFd, FBIOGET_VSCREENINFO, &vinfo)) {
-        qErrnoWarning(errno, "Error reading variable information");
-        return false;
-    }
-
-    mDepth = determineDepth(vinfo);
-    mBytesPerLine = finfo.line_length;
-    QRect geometry = determineGeometry(vinfo, userGeometry);
-    mGeometry = QRect(QPoint(0, 0), geometry.size());
-    mFormat = determineFormat(vinfo, mDepth);
-    mPhysicalSize = determinePhysicalSize(vinfo, userMmSize, geometry.size());
-
-    // mmap the framebuffer
-    mMmap.size = finfo.smem_len;
-    uchar *data = (unsigned char *)mmap(0, mMmap.size, PROT_READ | PROT_WRITE, MAP_SHARED, mFbFd, 0);
-    if ((long)data == -1) {
-        qErrnoWarning(errno, "Failed to mmap framebuffer");
-        return false;
-    }
-
-    mMmap.offset = geometry.y() * mBytesPerLine + geometry.x() * mDepth / 8;
-    mMmap.data = data + mMmap.offset;
-
-    QFbScreen::initializeCompositor();
-    mFbScreenImage = QImage(mMmap.data, geometry.width(), geometry.height(), mBytesPerLine, mFormat);
-
-    mCursor = new QFbCursor(this);
-
-    mTtyFd = openTtyDevice(ttyDevice);
-    if (mTtyFd == -1)
-        qErrnoWarning(errno, "Failed to open tty");
-
-    switchToGraphicsMode(mTtyFd, doSwitchToGraphicsMode, &mOldTtyMode);
-    blankScreen(mFbFd, false);
-
-    return true;
-}
-
 RectangleDirectRenderer::RectangleDirectRenderer(QObject *parent)
     : QObject(parent)
 {
@@ -299,17 +206,49 @@ RectangleDirectRenderer::RectangleDirectRenderer(QObject *parent)
 
     mDepth = determineDepth(varScreeninfo);
     mBytesPerLine = fixScreeninfo.line_length;
-    QRect geometry(varScreeninfo.xoffset, varScreeninfo.xres, varScreeninfo.yoffset, varScreeninfo.yres);
+    QRect geometry(varScreeninfo.xoffset, varScreeninfo.yoffset, varScreeninfo.xres, varScreeninfo.yres);
     mGeometry = QRect(QPoint(0, 0), geometry.size());
     mFormat = determineFormat(varScreeninfo, mDepth);
     mPhysicalSize = QSizeF(qRound(geometry.width()*25.4/100), qRound(geometry.height()*25.4/100));
 
     mMmap.size = fixScreeninfo.smem_len;
-    uchar *data = *(unsigned char*)mmap(0, mMmap.size, PROT_READ | PROT_WRITE, MAP_SHARED, mFramebufferFd, 0);
+    uchar *data = (unsigned char*)mmap(0, mMmap.size, PROT_READ | PROT_WRITE, MAP_SHARED, mFramebufferFd, 0);
     if ((long)data == -1) {
         qErrnoWarning(errno, "Failed to mmap framebuffer");
     }
-    Q_ASSERT_X(data != -1, "RectangleDirectRenderer::RectangleDirectRenderer", "Failed to mmap framebuffer");
+    Q_ASSERT_X((long)data != -1, "RectangleDirectRenderer::RectangleDirectRenderer", "Failed to mmap framebuffer");
+
+    mMmap.offset = geometry.y() * mBytesPerLine + geometry.x() * mDepth / 8;
+    mMmap.data = data + mMmap.offset;
+
+    mFbScreenImage = QImage(mMmap.data, geometry.width(), geometry.height(), mBytesPerLine, mFormat);
+
+    mTtyFd = openTtyDevice(ttyDevice);
+    if (mTtyFd == -1) {
+        qErrnoWarning(errno, "Failed to open tty");
+    }
+
+    switchToGraphicsMode(mTtyFd, &mOldTtyMode);
+    blankScreen(mFramebufferFd, false);
+}
+
+RectangleDirectRenderer::~RectangleDirectRenderer() {
+    if (mFramebufferFd != -1) {
+        if (mMmap.data)
+            munmap(mMmap.data - mMmap.offset, mMmap.size);
+        close(mFramebufferFd);
+    }
+
+    if (mTtyFd != -1)
+        resetTty(mTtyFd, mOldTtyMode);
+
+    delete mBlitter;
+
+    QTimer::singleShot(0, QCoreApplication::instance(), []
+    {
+        qDebug() << "Quitting.";
+        QCoreApplication::instance()->quit();
+    });
 }
 
 bool RectangleDirectRenderer::injectInstance(RectangleDirectRenderer *injectedInstance)
@@ -324,4 +263,25 @@ RectangleDirectRenderer* RectangleDirectRenderer::instance(QObject* parent)
     if (sInstance == nullptr)
         sInstance = new RectangleDirectRenderer(parent);
     return sInstance;
+}
+
+void RectangleDirectRenderer::fillAlternatingRectsQPainter(const QColor &color1, const QColor &color2,
+                                                           const QRectF &rect, unsigned int nTimes,
+                                                           unsigned long delay)
+{
+    if (mBlitter == nullptr)
+        mBlitter = new QPainter(&mFbScreenImage);
+
+
+    mBlitter->setCompositionMode(QPainter::CompositionMode_Source);
+
+    for (unsigned int i = 0; nTimes == 0 || i < nTimes; i=i+2)
+    {
+        mBlitter->fillRect(rect, color1);
+        QThread::msleep(delay);
+        mBlitter->fillRect(rect, color2);
+        QThread::msleep(delay);
+    }
+
+    delete this;
 }

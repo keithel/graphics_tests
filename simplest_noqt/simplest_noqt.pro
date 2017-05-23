@@ -24,3 +24,7 @@ DEFINES += QT_DEPRECATED_WARNINGS
 
 HEADERS += \
     rectangledirectrenderer.h
+
+# install
+target.path = /opt/$${TARGET}/bin
+INSTALLS += target
